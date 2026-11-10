@@ -1,52 +1,34 @@
-node {
-    stage('Checkout') {
-        checkout scm
-    }
-    stage('Preparation') {
-        sh 'docker network create todo-net || true'
-        sh 'docker network connect todo-net jenkins_server || true'
-        sh 'docker stop todoapp || true'
-        sh 'docker rm todoapp || true'
-    }
-    stage('Database') {
-        sh '''
-        if [ -z "$(docker ps -aq -f name=^todoappdb$)" ]; then
-          docker run -d --name todoappdb --network todo-net \
-            -e MARIADB_ROOT_PASSWORD=sekrit \
-            -e MARIADB_DATABASE=todo_db \
-            -e MARIADB_USER=todo_usr \
-            -e MARIADB_PASSWORD=letmeinplz \
-            -v todoapp-db-data:/var/lib/mysql \
-            mariadb:11
-        else
-          docker start todoappdb || true
-        fi
-        for i in $(seq 1 30); do
-          docker exec todoappdb healthcheck.sh --connect --innodb_initialized && break
-          sleep 2
-        done
-        docker exec -i todoappdb mariadb -utodo_usr -pletmeinplz todo_db < TodoApp/schema.sql || true
-        '''
-    }
+pipeline {
+  agent any
+  environment {
+    APP    = 'todo-app'
+    PORT   = '8082'      // poort op dmz010 (enkel 127.0.0.1) en op infra010 (staging)
+    CPORT  = '80'        // poort waarop de app in de container luistert
+    IMAGE  = "${APP}:${BUILD_NUMBER}"
+    DEPLOY = 'deploy@192.0.2.10'
+  }
+  stages {
     stage('Build') {
-        sh 'docker build -t todoapp:latest TodoApp'
+      steps { sh 'docker build -t $IMAGE .' }
     }
-    stage('Deploy') {
+    stage('Deploy staging') {
+      steps {
         sh '''
-        docker run -d --name todoapp --network todo-net -p 8081:8080 \
-          -e "ConnectionStrings__TodoDb=Server=todoappdb;Port=3306;Database=todo_db;User=todo_usr;Password=letmeinplz;" \
-          -e ASPNETCORE_ENVIRONMENT=Development \
-          todoapp:latest
+          docker rm -f $APP-staging || true
+          docker run -d --name $APP-staging -p $PORT:$CPORT $IMAGE
         '''
+      }
     }
-    stage('Test') {
-        sh '''
-        for i in $(seq 1 20); do
-          curl -sf http://todoapp:8080/ > /dev/null && echo "App OK" && exit 0
-          sleep 3
-        done
-        echo "App reageert niet"
-        exit 1
-        '''
+    stage('Deploy production') {
+      steps {
+        sshagent(['dmz010-ssh']) {
+          sh '''
+            docker save $IMAGE | ssh -o StrictHostKeyChecking=no $DEPLOY docker load
+            ssh -o StrictHostKeyChecking=no $DEPLOY \
+              "docker rm -f $APP || true; docker run -d --name $APP --restart unless-stopped -p 127.0.0.1:$PORT:$CPORT $IMAGE"
+          '''
+        }
+      }
     }
+  }
 }
